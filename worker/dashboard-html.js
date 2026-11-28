@@ -176,7 +176,6 @@ export function renderDashboardHtml({ authenticated, configured }) {
       "tailscale-funnel": "Tailscale Funnel",
       "tailscale-ip": "Tailscale IP",
       "lan": "同一 Wi-Fi / 局域网",
-      "lan-listen": "局域网监听 (0.0.0.0)",
       "custom-proxy": "自备隧道 / 反代 (CF/nginx/frp)",
       "remote-peer": "SSH / 远程节点 (Peer)",
     };
@@ -188,12 +187,17 @@ export function renderDashboardHtml({ authenticated, configured }) {
       "ssh-remote": "SSH 远端 Host",
       "cli": "CLI / 外部客户端",
     };
-    const FEATURE_LABELS = {
-      "delegation": "跨 Harness 委派",
-      "remote-peer": "Remote Peer 多机",
-      "notifications": "系统通知 / Web Push",
-      "schedules": "定时任务",
-      "no-codex-account": "无原生 Codex 账号运行",
+    const LANGUAGE_LABELS = {
+      "zh": "中文 (zh)",
+      "en": "English (en)",
+      "ja": "日本語 (ja)",
+      "ko": "한국어 (ko)",
+      "de": "Deutsch (de)",
+      "fr": "Français (fr)",
+      "es": "Español (es)",
+      "pt": "Português (pt)",
+      "ru": "Русский (ru)",
+      "other": "其他语言",
     };
 
     let state = {
@@ -247,7 +251,7 @@ export function renderDashboardHtml({ authenticated, configured }) {
     }
 
     function renderBars(items, labels = {}, colorClass = "", limit = 12) {
-      if (!items || items.length === 0) return '<div class="empty">暂无数据（客户端升级接入心跳后自动展示）</div>';
+      if (!items || items.length === 0) return '<div class="empty">暂无数据（客户端升级接入零 ID 计数后自动展示）</div>';
       const sliced = items.slice(0, limit);
       const max = Math.max(1, ...sliced.map((i) => i.count));
       const sum = sliced.reduce((acc, i) => acc + i.count, 0);
@@ -270,11 +274,11 @@ export function renderDashboardHtml({ authenticated, configured }) {
           <div class="card auth-card">
             <div class="brand" style="margin-bottom:8px;">
               <h1>CodexHost Analytics</h1>
-              <span class="pill">D1</span>
+              <span class="pill">D1 · Zero-ID</span>
             </div>
             \${!state.configured
               ? '<p class="err">服务端尚未配置 <code>DASHBOARD_TOKEN</code> Secret，请先通过 wrangler secret put DASHBOARD_TOKEN 配置。</p>'
-              : \`<p class="kpi-sub">请输入管理员 Dashboard Token 以查看产品统计与插件生态数据。</p>
+              : \`<p class="kpi-sub">请输入管理员 Dashboard Token 以查看零 ID 产品统计与插件生态数据。</p>
                  <form id="login-form">
                    <input id="token-input" type="password" autocomplete="current-password" placeholder="DASHBOARD_TOKEN" required />
                    <button class="btn primary" style="width:100%" type="submit">进入看板</button>
@@ -313,29 +317,11 @@ export function renderDashboardHtml({ authenticated, configured }) {
 
       // Remote access official vs self-hosted comparison
       const raUsers = pick(d?.breakdowns?.remoteAccess);
-      const raSessions = pick(d?.breakdowns?.remoteAccessSessions);
-      const raConfigured = pick(d?.breakdowns?.remoteConfigured);
       const findCount = (list, dim) => (list.find((x) => x.dim === dim)?.count ?? 0);
       const officialUsers = findCount(raUsers, "official-relay");
       const selfUsers = findCount(raUsers, "self-hosted-relay");
-      const officialSess = findCount(raSessions, "official-relay");
-      const selfSess = findCount(raSessions, "self-hosted-relay");
       const relayTotalUsers = officialUsers + selfUsers;
       const officialPct = relayTotalUsers > 0 ? (officialUsers / relayTotalUsers) * 100 : 50;
-
-      const allRemoteDims = [...new Set([
-        ...raUsers.map((x) => x.dim),
-        ...raSessions.map((x) => x.dim),
-        ...raConfigured.map((x) => x.dim),
-      ])];
-      const remoteRows = allRemoteDims
-        .map((dim) => ({
-          dim,
-          users: findCount(raUsers, dim),
-          sessions: findCount(raSessions, dim),
-          configured: findCount(raConfigured, dim),
-        }))
-        .sort((a, b) => b.users - a.users || b.sessions - a.sessions || b.configured - a.configured);
 
       const syncOk = d?.sync?.ok === true;
       const syncText = d?.sync
@@ -347,7 +333,7 @@ export function renderDashboardHtml({ authenticated, configured }) {
           <header>
             <div class="brand">
               <h1>CodexHost 产品数据看板</h1>
-              <span class="pill">Cloudflare D1</span>
+              <span class="pill">Cloudflare D1 · Zero-ID</span>
               <span class="pill \${syncOk ? "ok" : "warn"}">\${esc(syncText)}</span>
             </div>
             <div class="controls">
@@ -376,17 +362,17 @@ export function renderDashboardHtml({ authenticated, configured }) {
               <div class="card">
                 <div class="kpi-label">本周 WAU / 本月 MAU</div>
                 <div class="kpi-value">\${fmt(s.wau)} / \${fmt(s.mau)}</div>
-                <div class="kpi-sub">累计匿名设备 \${fmt(s.totalDevices)}</div>
+                <div class="kpi-sub">累计装机计数 \${fmt(s.totalInstalls)}</div>
               </div>
               <div class="card">
                 <div class="kpi-label">次日 / 7日留存</div>
                 <div class="kpi-value">\${s.retention.d1Rate === null ? "—" : (s.retention.d1Rate * 100).toFixed(1) + "%"} / \${s.retention.d7Rate === null ? "—" : (s.retention.d7Rate * 100).toFixed(1) + "%"}</div>
-                <div class="kpi-sub">7日内回访 \${s.retention.w1Rate === null ? "—" : (s.retention.w1Rate * 100).toFixed(1) + "%"}</div>
+                <div class="kpi-sub">本地日期判重 · 零 ID 聚合</div>
               </div>
               <div class="card">
                 <div class="kpi-label">今日远程访问</div>
                 <div class="kpi-value">\${fmt(s.remoteUsersToday)}</div>
-                <div class="kpi-sub">占今日 DAU \${pct(s.remoteUsersToday, s.dauToday)} · 连接量 \${fmt(s.remoteSessionsToday)}</div>
+                <div class="kpi-sub">占今日 DAU \${pct(s.remoteUsersToday, s.dauToday)}</div>
               </div>
               <div class="card">
                 <div class="kpi-label">累计插件下载量</div>
@@ -400,22 +386,20 @@ export function renderDashboardHtml({ authenticated, configured }) {
                 <div class="card-title">活跃与新增趋势 <span class="card-sub">近 \${d.days} 天 (UTC)</span></div>
                 \${renderLineChart(d.series, [
                   { key: "dau", label: "DAU", color: "var(--accent)" },
-                  { key: "newUsers", label: "新增设备", color: "var(--green)" },
-                  { key: "remoteUsers", label: "远程访问设备", color: "var(--purple)" },
+                  { key: "newUsers", label: "新增装机", color: "var(--green)" },
+                  { key: "remoteUsers", label: "远程访问活跃", color: "var(--purple)" },
                 ])}
               </div>
               <div class="card">
-                <div class="card-title">远程访问专题：官方 vs 自建 <span class="card-sub">\${mode === "today" ? "今日" : "近" + d.days + "天设备日"}</span></div>
+                <div class="card-title">远程访问专题：官方 vs 自建 <span class="card-sub">\${mode === "today" ? "今日" : "近" + d.days + "天日活累计"}</span></div>
                 <div class="split-box">
                   <div class="split-item">
                     <span class="kpi-label">官方加密中转 (relay.chost.dev)</span>
-                    <strong>\${fmt(officialUsers)} <span class="kpi-sub">设备</span></strong>
-                    <div class="kpi-sub">访问量 \${fmt(officialSess)} 次</div>
+                    <strong>\${fmt(officialUsers)}</strong>
                   </div>
                   <div class="split-item">
                     <span class="kpi-label">自建加密中转</span>
-                    <strong>\${fmt(selfUsers)} <span class="kpi-sub">设备</span></strong>
-                    <div class="kpi-sub">访问量 \${fmt(selfSess)} 次</div>
+                    <strong>\${fmt(selfUsers)}</strong>
                   </div>
                 </div>
                 <div class="split-bar" title="官方 vs 自建中转占比">
@@ -423,33 +407,16 @@ export function renderDashboardHtml({ authenticated, configured }) {
                   <div style="width:\${(100 - officialPct).toFixed(1)}%;background:var(--purple)"></div>
                 </div>
                 \${renderLineChart(d.series, [
-                  { key: "officialRelaySessions", label: "官方中转访问量", color: "var(--accent)" },
-                  { key: "selfHostedRelaySessions", label: "自建中转访问量", color: "var(--purple)" },
-                  { key: "remoteSessions", label: "全部远程访问量", color: "var(--amber)" },
+                  { key: "officialRelayUsers", label: "官方中转日活", color: "var(--accent)" },
+                  { key: "selfHostedRelayUsers", label: "自建中转日活", color: "var(--purple)" },
+                  { key: "remoteUsers", label: "全部远程访问日活", color: "var(--amber)" },
                 ])}
               </div>
             </section>
 
             <section class="card" style="margin-bottom:16px">
-              <div class="card-title">全类型远程访问明细 <span class="card-sub">区分实际产生已认证流量 vs 仅开启配置</span></div>
-              \${remoteRows.length === 0 ? '<div class="empty">暂无远程访问记录（等待客户端接入心跳上报）</div>' : \`
-                <div class="table-wrap"><table>
-                  <thead><tr>
-                    <th>远程访问类型</th>
-                    <th class="num">活跃设备\${mode === "today" ? "(今日)" : "(设备日)"}</th>
-                    <th class="num">访问/连接量</th>
-                    <th class="num">已启用配置设备</th>
-                  </tr></thead>
-                  <tbody>
-                    \${remoteRows.map((r) => \`<tr>
-                      <td>\${esc(CHANNEL_LABELS[r.dim] || r.dim)}</td>
-                      <td class="num">\${fmt(r.users)}</td>
-                      <td class="num">\${fmt(r.sessions)}</td>
-                      <td class="num">\${fmt(r.configured)}</td>
-                    </tr>\`).join("")}
-                  </tbody>
-                </table></div>
-              \`}
+              <div class="card-title">全类型远程访问通道分布 <span class="card-sub">仅统计实际发生已认证远程连接的通道</span></div>
+              \${renderBars(raUsers, CHANNEL_LABELS, "purple", 12)}
             </section>
 
             <section class="grid-3">
@@ -458,11 +425,8 @@ export function renderDashboardHtml({ authenticated, configured }) {
                 \${renderBars(pick(d.breakdowns.harnesses), {}, "purple", 20)}
               </div>
               <div class="card">
-                <div class="card-title">入口形态 & 核心功能 <span class="card-sub">Desktop vs Web</span></div>
+                <div class="card-title">入口形态 <span class="card-sub">Desktop vs Web</span></div>
                 \${renderBars(pick(d.breakdowns.surfaces), SURFACE_LABELS, "")}
-                <div style="height:14px"></div>
-                <div class="card-title" style="font-size:14px;margin-bottom:8px">核心特性采用</div>
-                \${renderBars(pick(d.breakdowns.features), FEATURE_LABELS, "green")}
               </div>
               <div class="card">
                 <div class="card-title">版本分布 <span class="card-sub">CodexHost & Codex Desktop</span></div>
@@ -483,19 +447,18 @@ export function renderDashboardHtml({ authenticated, configured }) {
                 \${renderBars(pick(d.breakdowns.countries), {}, "green", 12)}
               </div>
               <div class="card">
-                <div class="card-title">语言环境</div>
-                \${renderBars(pick(d.breakdowns.locales), {}, "purple", 10)}
+                <div class="card-title">界面语言 <span class="card-sub">粗粒度主语言码</span></div>
+                \${renderBars(pick(d.breakdowns.uiLanguages), LANGUAGE_LABELS, "purple", 10)}
               </div>
             </section>
 
             <section class="card">
-              <div class="card-title">插件市场生态 <span class="card-sub">累计下载量 · 区间新增 · 活跃装机</span></div>
+              <div class="card-title">插件市场生态 <span class="card-sub">累计下载量 · 区间新增</span></div>
               <div class="table-wrap"><table>
                 <thead><tr>
                   <th>扩展 ID</th>
                   <th class="num">累计下载</th>
                   <th class="num">近\${d.days}天新增</th>
-                  <th class="num">今日活跃启用</th>
                   <th class="num">更新时间 (UTC)</th>
                 </tr></thead>
                 <tbody>
@@ -503,7 +466,6 @@ export function renderDashboardHtml({ authenticated, configured }) {
                     <td><code>\${esc(e.id)}</code></td>
                     <td class="num"><strong>\${fmt(e.downloads)}</strong></td>
                     <td class="num">\${fmt(e.rangeDownloads)}</td>
-                    <td class="num">\${fmt(e.activeDevicesToday)}</td>
                     <td class="num" style="color:var(--muted)">\${esc((e.updatedAt || "").slice(0, 19).replace("T", " "))}</td>
                   </tr>\`).join("")}
                 </tbody>
@@ -512,7 +474,7 @@ export function renderDashboardHtml({ authenticated, configured }) {
 
             <footer>
               <span>数据生成时间 (UTC)：\${esc(d.generatedAt)}</span>
-              <span>仅存储匿名随机设备 ID 与聚合计数，不采集 IP、账号或会话内容</span>
+              <span>去重逻辑全在客户端本地完成；服务端零设备表、零设备 ID、零 IP，仅存聚合计数</span>
             </footer>
           \`}
         </div>\`;

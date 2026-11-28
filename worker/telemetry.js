@@ -1,9 +1,23 @@
-// Product telemetry, D1-backed extension stats, and authenticated dashboard queries.
+/**
+ * Zero-ID anonymous product telemetry, D1-backed extension stats, and authenticated dashboard queries.
+ *
+ * Privacy boundary & design rationale:
+ * - Zero persistent identifiers: clients perform daily/weekly/monthly/retention deduplication
+ *   strictly locally on disk and transmit ONLY stateless boolean increment flags and strictly
+ *   allowlisted coarse dimensions (appVersion, codexDesktopVersion, os, arch, uiLanguage,
+ *   surfaces, remoteAccess channel category, and official Harness IDs).
+ * - Because no `installId`, UUID, hardware fingerprint, account hash, or client IP is ever
+ *   accepted or stored, D1 holds ONLY aggregate counters (`daily_metrics` / `period_metrics`).
+ *   Two requests cannot be correlated to the same machine or user.
+ * - Server-side country aggregation uses only Cloudflare's coarse 2-letter edge country code
+ *   (`request.cf.country`) counted once per `dailyActive` heartbeat; raw IP addresses are never
+ *   logged or stored.
+ * - Never accepts prompts, conversation content, file paths, repository names, credentials,
+ *   model/provider usage, private Relay hostnames, local extensions, or custom Harness names.
+ */
 
 export const EXTENSION_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
-const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const VERSION_PATTERN = /^[0-9A-Za-z._+-]{1,40}$/u;
-const LOCALE_PATTERN = /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$/u;
 const COUNTRY_PATTERN = /^[A-Z]{2}$/u;
 
 export const ALLOWED_SURFACES = new Set([
@@ -17,6 +31,19 @@ export const ALLOWED_SURFACES = new Set([
 
 export const ALLOWED_OS = new Set(["darwin", "win32", "linux"]);
 export const ALLOWED_ARCH = new Set(["arm64", "x64", "ia32", "arm"]);
+
+export const ALLOWED_UI_LANGUAGES = new Set([
+  "zh",
+  "en",
+  "ja",
+  "ko",
+  "de",
+  "fr",
+  "es",
+  "pt",
+  "ru",
+  "other",
+]);
 
 export const ALLOWED_HARNESSES = new Set([
   "codex",
@@ -53,28 +80,7 @@ export const ALLOWED_REMOTE_ACCESS_CHANNELS = new Set([
   "remote-peer",
 ]);
 
-export const ALLOWED_REMOTE_CONFIGURED = new Set([
-  "official-relay",
-  "self-hosted-relay",
-  "tailscale-serve",
-  "tailscale-funnel",
-  "lan-listen",
-  "custom-proxy",
-  "remote-peer",
-]);
-
-export const ALLOWED_FEATURES = new Set([
-  "delegation",
-  "remote-peer",
-  "notifications",
-  "schedules",
-  "no-codex-account",
-]);
-
-const MAX_HEARTBEAT_BYTES = 8 * 1024;
-const MAX_EXTENSIONS_PER_HEARTBEAT = 64;
-const MAX_REMOTE_COUNT_PER_DAY = 100_000;
-const DAILY_DEVICE_STATE_RETENTION_DAYS = 14;
+const MAX_HEARTBEAT_BYTES = 4 * 1024;
 const DASHBOARD_COOKIE_HTTPS = "__Host-ch_dash_session";
 const DASHBOARD_COOKIE_HTTP = "ch_dash_session";
 const DASHBOARD_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -131,95 +137,88 @@ function sanitizeAllowedList(raw, allowedSet, maxItems = 32) {
   return out.sort();
 }
 
-function sanitizeExtensionList(raw) {
-  if (!Array.isArray(raw)) return [];
-  const out = [];
-  const seen = new Set();
-  for (const item of raw) {
-    if (typeof item !== "string") continue;
-    const v = item.trim();
-    if (v.length > 64 || !EXTENSION_ID_PATTERN.test(v) || seen.has(v)) continue;
-    seen.add(v);
-    out.push(v);
-    if (out.length >= MAX_EXTENSIONS_PER_HEARTBEAT) break;
-  }
-  return out.sort();
-}
-
-function sanitizeRemoteCounts(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const out = Object.create(null);
-  for (const [channel, count] of Object.entries(raw)) {
-    if (!ALLOWED_REMOTE_ACCESS_CHANNELS.has(channel)) continue;
-    if (typeof count !== "number" || !Number.isSafeInteger(count) || count <= 0) continue;
-    out[channel] = Math.min(count, MAX_REMOTE_COUNT_PER_DAY);
-  }
-  return out;
-}
-
-export function normalizeLocale(raw) {
+export function normalizeUiLanguage(raw) {
   if (typeof raw !== "string") return null;
   const cleaned = raw.trim().replaceAll("_", "-").split(".")[0];
-  if (!LOCALE_PATTERN.test(cleaned)) return null;
-  const [lang, region] = cleaned.split("-");
-  if (!lang) return null;
-  return region ? `${lang.toLowerCase()}-${region.toUpperCase()}` : lang.toLowerCase();
+  if (!cleaned) return null;
+  const primary = cleaned.split("-")[0]?.toLowerCase();
+  if (!primary || !/^[a-z]{2,5}$/u.test(primary)) return null;
+  return ALLOWED_UI_LANGUAGES.has(primary) ? primary : "other";
 }
 
 export function parseHeartbeatPayload(body, cfCountry) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { ok: false, error: "Invalid JSON object" };
   }
-  const installId = sanitizeString(body.installId, UUID_V4_PATTERN, 36)?.toLowerCase();
-  if (!installId) {
-    return { ok: false, error: "Invalid installId" };
+  // Explicitly reject client identifiers so this endpoint stays strictly zero-ID.
+  if ("installId" in body || "deviceId" in body || "userId" in body) {
+    return { ok: false, error: "Client identifiers are not accepted" };
   }
+
+  const dailyActive = body.dailyActive === true;
+  const weeklyActive = body.weeklyActive === true;
+  const monthlyActive = body.monthlyActive === true;
+  const newInstall = body.newInstall === true;
+  const retainedD1 = body.retainedD1 === true;
+  const retainedD7 = body.retainedD7 === true;
+  const remoteAny = body.remoteAny === true;
 
   const appVersion = sanitizeString(body.appVersion, VERSION_PATTERN, 40);
   const codexDesktopVersion = sanitizeString(body.codexDesktopVersion, VERSION_PATTERN, 40);
   const os = typeof body.os === "string" && ALLOWED_OS.has(body.os) ? body.os : null;
   const arch = typeof body.arch === "string" && ALLOWED_ARCH.has(body.arch) ? body.arch : null;
-  const locale = normalizeLocale(body.locale);
+  const uiLanguage = normalizeUiLanguage(body.uiLanguage);
+
+  // Only aggregate Cloudflare edge country once per dailyActive heartbeat to prevent double counting.
   const country =
-    typeof cfCountry === "string" && COUNTRY_PATTERN.test(cfCountry.toUpperCase())
+    dailyActive && typeof cfCountry === "string" && COUNTRY_PATTERN.test(cfCountry.toUpperCase())
       ? cfCountry.toUpperCase()
       : null;
 
   const surfaces = sanitizeAllowedList(body.surfaces, ALLOWED_SURFACES, 12);
   const harnesses = sanitizeAllowedList(body.harnesses, ALLOWED_HARNESSES, 32);
-  const extensions = sanitizeExtensionList(body.extensions);
-  const remoteCounts = sanitizeRemoteCounts(body.remoteAccessCounts);
-  const remoteAccessSet = new Set(
-    sanitizeAllowedList(body.remoteAccess, ALLOWED_REMOTE_ACCESS_CHANNELS, 12),
-  );
-  for (const channel of Object.keys(remoteCounts)) {
-    remoteAccessSet.add(channel);
+  const remoteAccess = sanitizeAllowedList(body.remoteAccess, ALLOWED_REMOTE_ACCESS_CHANNELS, 12);
+
+  const hasSignal =
+    dailyActive ||
+    weeklyActive ||
+    monthlyActive ||
+    newInstall ||
+    retainedD1 ||
+    retainedD7 ||
+    remoteAny ||
+    appVersion !== null ||
+    codexDesktopVersion !== null ||
+    os !== null ||
+    arch !== null ||
+    uiLanguage !== null ||
+    surfaces.length > 0 ||
+    harnesses.length > 0 ||
+    remoteAccess.length > 0;
+
+  if (!hasSignal) {
+    return { ok: false, error: "Empty telemetry payload" };
   }
-  const remoteAccess = [...remoteAccessSet].sort();
-  const remoteConfigured = sanitizeAllowedList(
-    body.remoteConfigured,
-    ALLOWED_REMOTE_CONFIGURED,
-    12,
-  );
-  const features = sanitizeAllowedList(body.features, ALLOWED_FEATURES, 16);
 
   return {
     ok: true,
     data: {
-      installId,
+      dailyActive,
+      weeklyActive,
+      monthlyActive,
+      newInstall,
+      retainedD1,
+      retainedD7,
+      remoteAny,
       appVersion,
       codexDesktopVersion,
       os,
       arch,
-      locale,
+      uiLanguage,
       country,
       surfaces,
       harnesses,
-      extensions,
       remoteAccess,
-      remoteConfigured,
-      features,
-      remoteCounts,
     },
   };
 }
@@ -237,31 +236,6 @@ export async function readBoundedJson(request, maxBytes = MAX_HEARTBEAT_BYTES) {
     return { ok: true, body: JSON.parse(text) };
   } catch {
     return { ok: false, status: 400, error: "Invalid JSON" };
-  }
-}
-
-function safeParseArray(text) {
-  if (typeof text !== "string") return [];
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed.filter((v) => typeof v === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-function safeParseCounts(text) {
-  if (typeof text !== "string") return {};
-  try {
-    const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const out = Object.create(null);
-    for (const [k, v] of Object.entries(parsed)) {
-      if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) out[k] = v;
-    }
-    return out;
-  } catch {
-    return {};
   }
 }
 
@@ -283,243 +257,72 @@ function incPeriodStmt(db, periodType, periodKey, metric, dim, delta = 1) {
     .bind(periodType, periodKey, metric, dim, delta);
 }
 
+/**
+ * Pure zero-ID aggregate counter update.
+ * Deduplication happens strictly on the client; the server writes only aggregate deltas.
+ */
 export async function recordHeartbeat(db, heartbeat, nowMs = Date.now()) {
   const day = utcDayString(nowMs);
   const week = isoWeekString(day);
   const month = utcMonthString(day);
-  const nowIso = new Date(nowMs).toISOString();
-
-  const [device, prevState] = await Promise.all([
-    db
-      .prepare(
-        `SELECT install_id, first_seen_day, last_seen_day, last_seen_week, last_seen_month,
-                retained_d1, retained_d7, retained_w1
-         FROM devices WHERE install_id = ?`,
-      )
-      .bind(heartbeat.installId)
-      .first(),
-    db
-      .prepare(
-        `SELECT app_version, codex_desktop_version, os, arch, locale, country,
-                surfaces_json, harnesses_json, extensions_json,
-                remote_access_json, remote_configured_json, features_json, remote_counts_json
-         FROM daily_device_state WHERE day = ? AND install_id = ?`,
-      )
-      .bind(day, heartbeat.installId)
-      .first(),
-  ]);
-
   const statements = [];
-  const isNewDevice = !device;
-  const isFirstToday = !prevState;
 
-  let nextRetD1 = device ? Number(device.retained_d1) || 0 : 0;
-  let nextRetD7 = device ? Number(device.retained_d7) || 0 : 0;
-  let nextRetW1 = device ? Number(device.retained_w1) || 0 : 0;
-
-  if (isNewDevice) {
+  if (heartbeat.newInstall) {
     statements.push(incDailyStmt(db, day, "new_users", "_all", 1));
-    statements.push(incPeriodStmt(db, "lifetime", "_all", "total_devices", "_all", 1));
-    statements.push(incPeriodStmt(db, "week", week, "wau", "_all", 1));
-    statements.push(incPeriodStmt(db, "month", month, "mau", "_all", 1));
-  } else {
-    if (device.last_seen_week !== week) {
-      statements.push(incPeriodStmt(db, "week", week, "wau", "_all", 1));
-    }
-    if (device.last_seen_month !== month) {
-      statements.push(incPeriodStmt(db, "month", month, "mau", "_all", 1));
-    }
-    const ageDays = diffUtcDays(device.first_seen_day, day);
-    if (ageDays === 1 && !nextRetD1) {
-      nextRetD1 = 1;
-      statements.push(incDailyStmt(db, device.first_seen_day, "ret_d1", "_all", 1));
-    }
-    if (ageDays === 7 && !nextRetD7) {
-      nextRetD7 = 1;
-      statements.push(incDailyStmt(db, device.first_seen_day, "ret_d7", "_all", 1));
-    }
-    if (ageDays >= 1 && ageDays <= 7 && !nextRetW1) {
-      nextRetW1 = 1;
-      statements.push(incDailyStmt(db, device.first_seen_day, "ret_w1", "_all", 1));
-    }
+    statements.push(incPeriodStmt(db, "lifetime", "_all", "total_installs", "_all", 1));
   }
-
-  if (isFirstToday) {
+  if (heartbeat.dailyActive) {
     statements.push(incDailyStmt(db, day, "dau", "_all", 1));
   }
-
-  // Scalar daily dimensions: transition cleanly if a value becomes known or updates mid-day.
-  const scalarPairs = [
-    ["app_version", prevState?.app_version ?? null, heartbeat.appVersion ?? prevState?.app_version ?? null],
-    [
-      "codex_version",
-      prevState?.codex_desktop_version ?? null,
-      heartbeat.codexDesktopVersion ?? prevState?.codex_desktop_version ?? null,
-    ],
-    ["os", prevState?.os ?? null, heartbeat.os ?? prevState?.os ?? null],
-    ["locale", prevState?.locale ?? null, heartbeat.locale ?? prevState?.locale ?? null],
-    ["country", prevState?.country ?? null, heartbeat.country ?? prevState?.country ?? null],
-  ];
-
-  const prevOsArch = prevState?.os && prevState?.arch ? `${prevState.os}-${prevState.arch}` : null;
-  const nextOs = heartbeat.os ?? prevState?.os ?? null;
-  const nextArch = heartbeat.arch ?? prevState?.arch ?? null;
-  const nextOsArch = nextOs && nextArch ? `${nextOs}-${nextArch}` : null;
-  scalarPairs.push(["os_arch", prevOsArch, nextOsArch]);
-
-  for (const [metric, prevVal, nextVal] of scalarPairs) {
-    if (prevVal === nextVal) continue;
-    if (prevVal) statements.push(incDailyStmt(db, day, metric, prevVal, -1));
-    if (nextVal) statements.push(incDailyStmt(db, day, metric, nextVal, 1));
+  if (heartbeat.weeklyActive) {
+    statements.push(incPeriodStmt(db, "week", week, "wau", "_all", 1));
+  }
+  if (heartbeat.monthlyActive) {
+    statements.push(incPeriodStmt(db, "month", month, "mau", "_all", 1));
+  }
+  if (heartbeat.retainedD1) {
+    statements.push(incDailyStmt(db, addUtcDays(day, -1), "ret_d1", "_all", 1));
+  }
+  if (heartbeat.retainedD7) {
+    statements.push(incDailyStmt(db, addUtcDays(day, -7), "ret_d7", "_all", 1));
   }
 
-  // Set-valued daily dimensions: union with today's already-counted set, incrementing only new dims.
-  const mergeSet = (prevJson, incoming, metric, trackAny = false) => {
-    const prevSet = new Set(safeParseArray(prevJson));
-    const hadAny = prevSet.size > 0;
-    for (const item of incoming) {
-      if (!prevSet.has(item)) {
-        prevSet.add(item);
-        statements.push(incDailyStmt(db, day, metric, item, 1));
-      }
-    }
-    if (trackAny && !hadAny && prevSet.size > 0) {
-      statements.push(incDailyStmt(db, day, metric, "_any", 1));
-    }
-    return [...prevSet].sort();
-  };
-
-  const nextSurfaces = mergeSet(prevState?.surfaces_json, heartbeat.surfaces, "surface");
-  const nextHarnesses = mergeSet(prevState?.harnesses_json, heartbeat.harnesses, "harness");
-  const nextExtensions = mergeSet(
-    prevState?.extensions_json,
-    heartbeat.extensions,
-    "extension_active",
-  );
-  const nextRemoteAccess = mergeSet(
-    prevState?.remote_access_json,
-    heartbeat.remoteAccess,
-    "remote_access",
-    true,
-  );
-  const nextRemoteConfigured = mergeSet(
-    prevState?.remote_configured_json,
-    heartbeat.remoteConfigured,
-    "remote_configured",
-    true,
-  );
-  const nextFeatures = mergeSet(prevState?.features_json, heartbeat.features, "feature");
-
-  // Monotonic daily remote access session volume per channel (delta against today's high-water mark).
-  const prevCounts = safeParseCounts(prevState?.remote_counts_json);
-  const nextCounts = { ...prevCounts };
-  let totalDelta = 0;
-  for (const [channel, reportedCount] of Object.entries(heartbeat.remoteCounts)) {
-    const prevCount = prevCounts[channel] ?? 0;
-    if (reportedCount > prevCount) {
-      const delta = reportedCount - prevCount;
-      nextCounts[channel] = reportedCount;
-      totalDelta += delta;
-      statements.push(incDailyStmt(db, day, "remote_access_sessions", channel, delta));
-    }
+  if (heartbeat.appVersion) {
+    statements.push(incDailyStmt(db, day, "app_version", heartbeat.appVersion, 1));
   }
-  if (totalDelta > 0) {
-    statements.push(incDailyStmt(db, day, "remote_access_sessions", "_all", totalDelta));
+  if (heartbeat.codexDesktopVersion) {
+    statements.push(incDailyStmt(db, day, "codex_version", heartbeat.codexDesktopVersion, 1));
+  }
+  if (heartbeat.os) {
+    statements.push(incDailyStmt(db, day, "os", heartbeat.os, 1));
+  }
+  if (heartbeat.os && heartbeat.arch) {
+    statements.push(incDailyStmt(db, day, "os_arch", `${heartbeat.os}-${heartbeat.arch}`, 1));
+  }
+  if (heartbeat.uiLanguage) {
+    statements.push(incDailyStmt(db, day, "ui_language", heartbeat.uiLanguage, 1));
+  }
+  if (heartbeat.country) {
+    statements.push(incDailyStmt(db, day, "country", heartbeat.country, 1));
   }
 
-  const nextAppVersion = heartbeat.appVersion ?? prevState?.app_version ?? null;
-  const nextCodexVersion =
-    heartbeat.codexDesktopVersion ?? prevState?.codex_desktop_version ?? null;
-  const nextLocale = heartbeat.locale ?? prevState?.locale ?? null;
-  const nextCountry = heartbeat.country ?? prevState?.country ?? null;
+  for (const surface of heartbeat.surfaces) {
+    statements.push(incDailyStmt(db, day, "surface", surface, 1));
+  }
+  for (const harness of heartbeat.harnesses) {
+    statements.push(incDailyStmt(db, day, "harness", harness, 1));
+  }
+  for (const channel of heartbeat.remoteAccess) {
+    statements.push(incDailyStmt(db, day, "remote_access", channel, 1));
+  }
+  if (heartbeat.remoteAny) {
+    statements.push(incDailyStmt(db, day, "remote_access", "_any", 1));
+  }
 
-  statements.push(
-    db
-      .prepare(
-        `INSERT INTO devices (
-           install_id, first_seen_day, last_seen_day, last_seen_week, last_seen_month,
-           retained_d1, retained_d7, retained_w1,
-           app_version, codex_desktop_version, os, arch, locale, country
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(install_id) DO UPDATE SET
-           last_seen_day = excluded.last_seen_day,
-           last_seen_week = excluded.last_seen_week,
-           last_seen_month = excluded.last_seen_month,
-           retained_d1 = excluded.retained_d1,
-           retained_d7 = excluded.retained_d7,
-           retained_w1 = excluded.retained_w1,
-           app_version = COALESCE(excluded.app_version, devices.app_version),
-           codex_desktop_version = COALESCE(excluded.codex_desktop_version, devices.codex_desktop_version),
-           os = COALESCE(excluded.os, devices.os),
-           arch = COALESCE(excluded.arch, devices.arch),
-           locale = COALESCE(excluded.locale, devices.locale),
-           country = COALESCE(excluded.country, devices.country)`,
-      )
-      .bind(
-        heartbeat.installId,
-        device?.first_seen_day ?? day,
-        day,
-        week,
-        month,
-        nextRetD1,
-        nextRetD7,
-        nextRetW1,
-        nextAppVersion,
-        nextCodexVersion,
-        nextOs,
-        nextArch,
-        nextLocale,
-        nextCountry,
-      ),
-  );
-
-  statements.push(
-    db
-      .prepare(
-        `INSERT INTO daily_device_state (
-           day, install_id, app_version, codex_desktop_version, os, arch, locale, country,
-           surfaces_json, harnesses_json, extensions_json,
-           remote_access_json, remote_configured_json, features_json, remote_counts_json,
-           updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(day, install_id) DO UPDATE SET
-           app_version = excluded.app_version,
-           codex_desktop_version = excluded.codex_desktop_version,
-           os = excluded.os,
-           arch = excluded.arch,
-           locale = excluded.locale,
-           country = excluded.country,
-           surfaces_json = excluded.surfaces_json,
-           harnesses_json = excluded.harnesses_json,
-           extensions_json = excluded.extensions_json,
-           remote_access_json = excluded.remote_access_json,
-           remote_configured_json = excluded.remote_configured_json,
-           features_json = excluded.features_json,
-           remote_counts_json = excluded.remote_counts_json,
-           updated_at = excluded.updated_at`,
-      )
-      .bind(
-        day,
-        heartbeat.installId,
-        nextAppVersion,
-        nextCodexVersion,
-        nextOs,
-        nextArch,
-        nextLocale,
-        nextCountry,
-        JSON.stringify(nextSurfaces),
-        JSON.stringify(nextHarnesses),
-        JSON.stringify(nextExtensions),
-        JSON.stringify(nextRemoteAccess),
-        JSON.stringify(nextRemoteConfigured),
-        JSON.stringify(nextFeatures),
-        JSON.stringify(nextCounts),
-        nowIso,
-      ),
-  );
-
-  await db.batch(statements);
-  return { ok: true, day, newDevice: isNewDevice };
+  if (statements.length > 0) {
+    await db.batch(statements);
+  }
+  return { ok: true, day };
 }
 
 export async function recordExtensionInstallD1(db, id, nowMs = Date.now()) {
@@ -593,27 +396,6 @@ export async function writeWorkerMetaD1(db, key, value, nowMs = Date.now()) {
   }
 }
 
-export async function pruneOldDailyDeviceState(db, nowMs = Date.now()) {
-  if (!db) return;
-  const today = utcDayString(nowMs);
-  const lastPruned = await readWorkerMetaD1(db, "last-prune-day");
-  if (lastPruned?.day === today) return;
-  const cutoff = addUtcDays(today, -DAILY_DEVICE_STATE_RETENTION_DAYS);
-  try {
-    await db.batch([
-      db.prepare(`DELETE FROM daily_device_state WHERE day < ?`).bind(cutoff),
-      db
-        .prepare(
-          `INSERT INTO worker_meta (key, value, updated_at) VALUES ('last-prune-day', ?, ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-        )
-        .bind(JSON.stringify({ day: today }), new Date(nowMs).toISOString()),
-    ]);
-  } catch {
-    // Non-critical housekeeping; retry next scheduled tick.
-  }
-}
-
 function buildDaySeries(startDay, days) {
   const list = [];
   for (let i = 0; i < days; i += 1) {
@@ -630,7 +412,10 @@ function sortBreakdown(map) {
 }
 
 export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Date.now()) {
-  const days = Math.min(90, Math.max(1, Number.isFinite(requestedDays) ? Math.floor(requestedDays) : 30));
+  const days = Math.min(
+    90,
+    Math.max(1, Number.isFinite(requestedDays) ? Math.floor(requestedDays) : 30),
+  );
   const today = utcDayString(nowMs);
   const startDay = addUtcDays(today, -(days - 1));
   const currentWeek = isoWeekString(today);
@@ -651,10 +436,14 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
       .bind(isoWeekString(addUtcDays(today, -84)), utcMonthString(addUtcDays(today, -365)))
       .all(),
     db
-      .prepare(`SELECT id, downloads, updated_at FROM extension_downloads ORDER BY downloads DESC, id ASC`)
+      .prepare(
+        `SELECT id, downloads, updated_at FROM extension_downloads ORDER BY downloads DESC, id ASC`,
+      )
       .all(),
     db
-      .prepare(`SELECT day, id, downloads FROM extension_downloads_daily WHERE day >= ? AND day <= ?`)
+      .prepare(
+        `SELECT day, id, downloads FROM extension_downloads_daily WHERE day >= ? AND day <= ?`,
+      )
       .bind(startDay, today)
       .all(),
     readWorkerMetaD1(db, "last-sync-check"),
@@ -668,13 +457,9 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
     newUsers: 0,
     retD1: 0,
     retD7: 0,
-    retW1: 0,
     remoteUsers: 0,
-    remoteSessions: 0,
     officialRelayUsers: 0,
     selfHostedRelayUsers: 0,
-    officialRelaySessions: 0,
-    selfHostedRelaySessions: 0,
     extensionInstalls: 0,
   }));
 
@@ -700,18 +485,11 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
       else if (row.metric === "new_users" && row.dim === "_all") point.newUsers = count;
       else if (row.metric === "ret_d1" && row.dim === "_all") point.retD1 = count;
       else if (row.metric === "ret_d7" && row.dim === "_all") point.retD7 = count;
-      else if (row.metric === "ret_w1" && row.dim === "_all") point.retW1 = count;
       else if (row.metric === "remote_access" && row.dim === "_any") point.remoteUsers = count;
       else if (row.metric === "remote_access" && row.dim === "official-relay")
         point.officialRelayUsers = count;
       else if (row.metric === "remote_access" && row.dim === "self-hosted-relay")
         point.selfHostedRelayUsers = count;
-      else if (row.metric === "remote_access_sessions" && row.dim === "_all")
-        point.remoteSessions = count;
-      else if (row.metric === "remote_access_sessions" && row.dim === "official-relay")
-        point.officialRelaySessions = count;
-      else if (row.metric === "remote_access_sessions" && row.dim === "self-hosted-relay")
-        point.selfHostedRelaySessions = count;
     }
 
     if (row.dim !== "_all" && row.dim !== "_any") {
@@ -732,15 +510,15 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
     extRangeDownloads.set(row.id, (extRangeDownloads.get(row.id) ?? 0) + count);
   }
 
-  let totalDevices = 0;
+  let totalInstalls = 0;
   let wau = 0;
   let mau = 0;
   const weeklySeries = [];
   const monthlySeries = [];
   for (const row of periodRes?.results ?? []) {
     const count = Number(row.count) || 0;
-    if (row.period_type === "lifetime" && row.metric === "total_devices") {
-      totalDevices = count;
+    if (row.period_type === "lifetime" && row.metric === "total_installs") {
+      totalInstalls += count;
     } else if (row.period_type === "week" && row.metric === "wau") {
       weeklySeries.push({ period: row.period_key, count });
       if (row.period_key === currentWeek) wau = count;
@@ -757,7 +535,6 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
   let d1Ret = 0;
   let d7Base = 0;
   let d7Ret = 0;
-  let w1Ret = 0;
   for (const p of series) {
     const age = diffUtcDays(p.day, today);
     if (age >= 1) {
@@ -767,12 +544,9 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
     if (age >= 7) {
       d7Base += p.newUsers;
       d7Ret += p.retD7;
-      w1Ret += p.retW1;
     }
   }
 
-  const activeExtToday = metricLatestDay.get("extension_active") ?? new Map();
-  const activeExtRange = metricTotals.get("extension_active") ?? new Map();
   let totalExtensionDownloads = 0;
   const extensions = (extTotalRes?.results ?? []).map((row) => {
     const total = Number(row.downloads) || 0;
@@ -781,8 +555,6 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
       id: row.id,
       downloads: total,
       rangeDownloads: extRangeDownloads.get(row.id) ?? 0,
-      activeDevicesToday: activeExtToday.get(row.id) ?? 0,
-      activeDeviceDaysRange: activeExtRange.get(row.id) ?? 0,
       updatedAt: row.updated_at,
     };
   });
@@ -803,9 +575,8 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
       newUsersToday: todayPoint.newUsers,
       wau,
       mau,
-      totalDevices,
+      totalInstalls,
       remoteUsersToday: todayPoint.remoteUsers,
-      remoteSessionsToday: todayPoint.remoteSessions,
       totalExtensionDownloads,
       retention: {
         d1Rate: d1Base > 0 ? Number((d1Ret / d1Base).toFixed(4)) : null,
@@ -814,8 +585,6 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
         d7Rate: d7Base > 0 ? Number((d7Ret / d7Base).toFixed(4)) : null,
         d7Returned: d7Ret,
         d7Cohort: d7Base,
-        w1Rate: d7Base > 0 ? Number((w1Ret / d7Base).toFixed(4)) : null,
-        w1Returned: w1Ret,
       },
     },
     series,
@@ -825,15 +594,12 @@ export async function queryDashboardOverview(db, requestedDays = 30, nowMs = Dat
       surfaces: breakdownFor("surface"),
       harnesses: breakdownFor("harness"),
       remoteAccess: breakdownFor("remote_access"),
-      remoteAccessSessions: breakdownFor("remote_access_sessions"),
-      remoteConfigured: breakdownFor("remote_configured"),
-      features: breakdownFor("feature"),
       appVersions: breakdownFor("app_version"),
       codexVersions: breakdownFor("codex_version"),
       os: breakdownFor("os"),
       osArch: breakdownFor("os_arch"),
       countries: breakdownFor("country"),
-      locales: breakdownFor("locale"),
+      uiLanguages: breakdownFor("ui_language"),
     },
     extensions,
     sync: syncMeta ?? null,

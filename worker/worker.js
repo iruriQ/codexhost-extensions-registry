@@ -3,7 +3,6 @@ import {
   createDashboardSessionCookie,
   isDashboardAuthenticated,
   parseHeartbeatPayload,
-  pruneOldDailyDeviceState,
   queryDashboardOverview,
   readBoundedJson,
   readExtensionStatsD1,
@@ -594,9 +593,7 @@ function syncResultStatus(summary) {
 export default {
   async scheduled(_event, env, ctx) {
     const tasks = [checkAndDispatchSync(env)];
-    if (env.STATS_DB) {
-      tasks.push(pruneOldDailyDeviceState(env.STATS_DB));
-    } else if (env.STATS_KV) {
+    if (!env.STATS_DB && env.STATS_KV) {
       tasks.push(refreshStatsSnapshot(env.STATS_KV));
     }
     ctx.waitUntil(Promise.allSettled(tasks));

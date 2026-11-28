@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import worker, { resetSyncState } from "./worker.js";
-import { pruneOldDailyDeviceState } from "./telemetry.js";
 
 const SCHEMA_SQL = readFileSync(new URL("./schema.sql", import.meta.url), "utf8");
 
@@ -49,7 +48,10 @@ function createSqliteD1() {
         for (const s of statements) {
           const stmt = sqlite.prepare(s.sql);
           if (/^\s*SELECT\b/iu.test(s.sql)) {
-            results.push({ success: true, results: stmt.all(...s.params).map((r) => ({ ...r })) });
+            results.push({
+              success: true,
+              results: stmt.all(...s.params).map((r) => ({ ...r })),
+            });
           } else {
             const info = stmt.run(...s.params);
             results.push({ success: true, results: [], meta: { changes: info.changes } });
@@ -132,102 +134,95 @@ test("D1 POST /install/:id atomically increments totals and daily counts, served
   });
 });
 
-test("POST /v1/telemetry/heartbeat validates input, merges same-day updates idempotently, and tracks official vs self-hosted remote access", async () => {
+test("POST /v1/telemetry/heartbeat enforces zero-ID payloads, aggregates deltas without double counting, and tracks official vs self-hosted remote access", async () => {
   const db = createSqliteD1();
   const env = { STATS_DB: db, DASHBOARD_TOKEN: "test-admin-secret-123" };
   const ctx = makeCtx();
 
-  const devA = "11111111-1111-4111-8111-111111111111";
-  const devB = "22222222-2222-4222-8222-222222222222";
-
   await withFakeNow(Date.parse("2026-11-28T02:00:00Z"), async () => {
-    // Reject invalid installId
-    const bad = await worker.fetch(
+    // Reject any payload containing client identifiers
+    const withId = await worker.fetch(
       new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ installId: "not-a-uuid" }),
+        body: JSON.stringify({
+          installId: "11111111-1111-4111-8111-111111111111",
+          dailyActive: true,
+        }),
       }),
       env,
       ctx,
     );
-    assert.equal(bad.status, 400);
+    assert.equal(withId.status, 400);
 
-    // First heartbeat from devA (morning: Desktop only)
+    // Reject empty payloads
+    const empty = await worker.fetch(
+      new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+      env,
+      ctx,
+    );
+    assert.equal(empty.status, 400);
+
+    // First heartbeat from machine A (morning: Desktop only)
     const req1 = new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        installId: devA,
-        appVersion: "0.28.1",
+        newInstall: true,
+        dailyActive: true,
+        weeklyActive: true,
+        monthlyActive: true,
+        appVersion: "0.28.2",
         codexDesktopVersion: "26.1023.50603",
         os: "darwin",
         arch: "arm64",
-        locale: "zh_CN.UTF-8",
+        uiLanguage: "zh-CN",
         surfaces: ["codex-desktop"],
         harnesses: ["codex", "claude-code", "invalid-harness-should-drop"],
-        extensions: ["sidebar-thread-tree", "BAD_ID!"],
-        remoteConfigured: ["official-relay"],
-        features: ["delegation"],
       }),
     });
     Object.defineProperty(req1, "cf", { value: { country: "CN" } });
     const h1 = await worker.fetch(req1, env, ctx);
     assert.equal(h1.status, 200);
-    assert.deepEqual(await h1.json(), { ok: true, day: "2026-11-28", newDevice: true });
+    assert.deepEqual(await h1.json(), { ok: true, day: "2026-11-28" });
 
-    // Second heartbeat from SAME devA later the same day: upgraded to 0.28.2, used Official Relay 3 times & Pi
+    // Same-day delta from machine A (afternoon: mobile via Official Relay + Pi)
+    // Does NOT repeat dailyActive, version, os, uiLanguage, or country!
     const req2 = new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        installId: devA,
-        appVersion: "0.28.2",
-        codexDesktopVersion: "26.1023.50603",
-        os: "darwin",
-        arch: "arm64",
-        locale: "zh-CN",
-        surfaces: ["codex-desktop", "web", "web-mobile"],
-        harnesses: ["codex", "claude-code", "pi"],
-        extensions: ["sidebar-thread-tree"],
+        surfaces: ["web", "web-mobile"],
+        harnesses: ["pi"],
         remoteAccess: ["official-relay"],
-        remoteAccessCounts: { "official-relay": 3 },
-        remoteConfigured: ["official-relay"],
-        features: ["delegation", "notifications"],
+        remoteAny: true,
       }),
     });
     Object.defineProperty(req2, "cf", { value: { country: "CN" } });
     const h2 = await worker.fetch(req2, env, ctx);
     assert.equal(h2.status, 200);
-    assert.deepEqual(await h2.json(), { ok: true, day: "2026-11-28", newDevice: false });
 
-    // Third heartbeat from devA with higher remoteAccessCounts (5 -> delta +2, NOT +5!)
-    const req3 = new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        installId: devA,
-        remoteAccessCounts: { "official-relay": 5 },
-      }),
-    });
-    assert.equal((await worker.fetch(req3, env, ctx)).status, 200);
-
-    // Heartbeat from devB using self-hosted relay + tailscale-serve
+    // Heartbeat from machine B using self-hosted relay + tailscale-serve
     const reqB = new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        installId: devB,
+        newInstall: true,
+        dailyActive: true,
+        weeklyActive: true,
+        monthlyActive: true,
         appVersion: "0.28.2",
         os: "linux",
         arch: "x64",
-        locale: "en-US",
+        uiLanguage: "en",
         surfaces: ["web"],
         harnesses: ["antigravity"],
         remoteAccess: ["self-hosted-relay", "tailscale-serve"],
-        remoteAccessCounts: { "self-hosted-relay": 4, "tailscale-serve": 2 },
-        remoteConfigured: ["self-hosted-relay", "tailscale-serve"],
-        features: ["no-codex-account", "remote-peer"],
+        remoteAny: true,
       }),
     });
     Object.defineProperty(reqB, "cf", { value: { country: "US" } });
@@ -248,21 +243,22 @@ test("POST /v1/telemetry/heartbeat validates input, merges same-day updates idem
     assert.equal(data.summary.newUsersToday, 2);
     assert.equal(data.summary.wau, 2);
     assert.equal(data.summary.mau, 2);
-    assert.equal(data.summary.totalDevices, 2);
+    assert.equal(data.summary.totalInstalls, 2);
     assert.equal(data.summary.remoteUsersToday, 2);
-    assert.equal(data.summary.remoteSessionsToday, 11); // 5 official + 4 self-hosted + 2 tailscale-serve
 
-    // Version transition: 0.28.1 should be decremented to 0, both devices now counted on 0.28.2
     assert.deepEqual(data.breakdowns.appVersions.today, [{ dim: "0.28.2", count: 2 }]);
+    assert.deepEqual(data.breakdowns.countries.today, [
+      { dim: "CN", count: 1 },
+      { dim: "US", count: 1 },
+    ]);
+    assert.deepEqual(data.breakdowns.uiLanguages.today, [
+      { dim: "en", count: 1 },
+      { dim: "zh", count: 1 },
+    ]);
     assert.deepEqual(data.breakdowns.remoteAccess.today, [
       { dim: "official-relay", count: 1 },
       { dim: "self-hosted-relay", count: 1 },
       { dim: "tailscale-serve", count: 1 },
-    ]);
-    assert.deepEqual(data.breakdowns.remoteAccessSessions.today, [
-      { dim: "official-relay", count: 5 },
-      { dim: "self-hosted-relay", count: 4 },
-      { dim: "tailscale-serve", count: 2 },
     ]);
     assert.deepEqual(
       data.breakdowns.harnesses.today.map((x) => x.dim),
@@ -271,33 +267,63 @@ test("POST /v1/telemetry/heartbeat validates input, merges same-day updates idem
   });
 });
 
-test("Multi-day retention (D1 / D7 / W1), WAU/MAU, and daily_device_state pruning work accurately", async () => {
+test("Zero-ID client-computed D1 and D7 retention booleans credit exact cohort days", async () => {
   const db = createSqliteD1();
   const env = { STATS_DB: db, DASHBOARD_TOKEN: "secret-key" };
   const ctx = makeCtx();
-  const dev1 = "33333333-3333-4333-8333-333333333333";
-  const dev2 = "44444444-4444-4444-8444-444444444444";
 
-  const send = async (dayIso, installId) =>
+  const send = async (dayIso, body) =>
     withFakeNow(Date.parse(dayIso), () =>
       worker.fetch(
         new Request("https://ext-stats.chost.dev/v1/telemetry/heartbeat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ installId, appVersion: "0.28.2", os: "darwin", arch: "arm64" }),
+          body: JSON.stringify(body),
         }),
         env,
         ctx,
       ),
     );
 
-  // Day 0 (2026-11-01): dev1 and dev2 join
-  assert.equal((await send("2026-11-01T09:00:00Z", dev1)).status, 200);
-  assert.equal((await send("2026-11-01T10:00:00Z", dev2)).status, 200);
-  // Day 1 (2026-11-02): dev1 returns (D1 + W1)
-  assert.equal((await send("2026-11-02T09:00:00Z", dev1)).status, 200);
-  // Day 7 (2026-11-08): dev1 returns again (D7); dev2 never returned
-  assert.equal((await send("2026-11-08T09:00:00Z", dev1)).status, 200);
+  // Day 0 (2026-11-01): 2 new installs join
+  assert.equal(
+    (
+      await send("2026-11-01T09:00:00Z", {
+        newInstall: true,
+        dailyActive: true,
+        weeklyActive: true,
+        monthlyActive: true,
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await send("2026-11-01T10:00:00Z", {
+        newInstall: true,
+        dailyActive: true,
+        weeklyActive: true,
+        monthlyActive: true,
+      })
+    ).status,
+    200,
+  );
+  // Day 1 (2026-11-02): 1 returns with retainedD1: true
+  assert.equal(
+    (await send("2026-11-02T09:00:00Z", { dailyActive: true, retainedD1: true })).status,
+    200,
+  );
+  // Day 7 (2026-11-08): 1 returns with retainedD7: true
+  assert.equal(
+    (
+      await send("2026-11-08T09:00:00Z", {
+        dailyActive: true,
+        weeklyActive: true,
+        retainedD7: true,
+      })
+    ).status,
+    200,
+  );
 
   await withFakeNow(Date.parse("2026-11-08T12:00:00Z"), async () => {
     const res = await worker.fetch(
@@ -308,7 +334,7 @@ test("Multi-day retention (D1 / D7 / W1), WAU/MAU, and daily_device_state prunin
       ctx,
     );
     const data = await res.json();
-    assert.equal(data.summary.totalDevices, 2);
+    assert.equal(data.summary.totalInstalls, 2);
     assert.equal(data.summary.mau, 2);
     assert.equal(data.summary.retention.d1Cohort, 2);
     assert.equal(data.summary.retention.d1Returned, 1);
@@ -316,15 +342,15 @@ test("Multi-day retention (D1 / D7 / W1), WAU/MAU, and daily_device_state prunin
     assert.equal(data.summary.retention.d7Cohort, 2);
     assert.equal(data.summary.retention.d7Returned, 1);
     assert.equal(data.summary.retention.d7Rate, 0.5);
-    assert.equal(data.summary.retention.w1Rate, 0.5);
   });
 
-  // Prune 20 days later removes old daily_device_state rows while keeping devices/metrics intact
-  await pruneOldDailyDeviceState(db, Date.parse("2026-11-28T00:00:00Z"));
-  const remaining = await db.prepare("SELECT COUNT(*) as c FROM daily_device_state").first();
-  assert.equal(remaining.c, 0);
-  const devicesStill = await db.prepare("SELECT COUNT(*) as c FROM devices").first();
-  assert.equal(devicesStill.c, 2);
+  // Verify database schema contains NO device tables
+  const tables = await db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .all();
+  const tableNames = tables.results.map((r) => r.name);
+  assert.equal(tableNames.includes("devices"), false);
+  assert.equal(tableNames.includes("daily_device_state"), false);
 });
 
 test("Dashboard cookie auth rejects invalid tokens and grants signed session cookie", async () => {
@@ -332,7 +358,6 @@ test("Dashboard cookie auth rejects invalid tokens and grants signed session coo
   const env = { STATS_DB: db, DASHBOARD_TOKEN: "top-secret-token" };
   const ctx = makeCtx();
 
-  // Unauthenticated overview -> 401
   const unauth = await worker.fetch(
     new Request("https://ext-stats.chost.dev/v1/dashboard/overview"),
     env,
@@ -340,7 +365,6 @@ test("Dashboard cookie auth rejects invalid tokens and grants signed session coo
   );
   assert.equal(unauth.status, 401);
 
-  // Wrong token -> 401
   const badLogin = await worker.fetch(
     new Request("https://ext-stats.chost.dev/v1/dashboard/auth", {
       method: "POST",
@@ -352,7 +376,6 @@ test("Dashboard cookie auth rejects invalid tokens and grants signed session coo
   );
   assert.equal(badLogin.status, 401);
 
-  // Correct token -> 200 + HttpOnly Secure SameSite=Strict cookie
   const goodLogin = await worker.fetch(
     new Request("https://ext-stats.chost.dev/v1/dashboard/auth", {
       method: "POST",
@@ -370,7 +393,6 @@ test("Dashboard cookie auth rejects invalid tokens and grants signed session coo
 
   const cookiePair = setCookie.split(";")[0];
 
-  // Overview with signed cookie -> 200
   const authedOverview = await worker.fetch(
     new Request("https://ext-stats.chost.dev/v1/dashboard/overview?days=7", {
       headers: { Cookie: cookiePair },
@@ -380,7 +402,6 @@ test("Dashboard cookie auth rejects invalid tokens and grants signed session coo
   );
   assert.equal(authedOverview.status, 200);
 
-  // Dashboard HTML renders authenticated boot flag
   const htmlRes = await worker.fetch(
     new Request("https://ext-stats.chost.dev/dashboard", {
       headers: { Cookie: cookiePair },

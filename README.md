@@ -207,7 +207,7 @@ CodexHost Desktop / CH Web 插件中心展示列表与更新提示
 
 - `secrets.CLOUDFLARE_API_TOKEN`：拥有 Workers Scripts Edit 权限的 Cloudflare API Token；
 - `secrets.CLOUDFLARE_ACCOUNT_ID`：Cloudflare Account ID；
-- `secrets.CLOUDFLARE_STATS_DB_ID`（或同名 Variable）：Cloudflare D1 `codexhost-stats` 数据库 ID（用于部署时替换 `worker/wrangler.toml` 中的 `YOUR_D1_DATABASE_ID`，承载扩展下载量、每日趋势与匿名产品统计）；
+- `secrets.CLOUDFLARE_STATS_DB_ID`（或同名 Variable）：Cloudflare D1 `codexhost-stats` 数据库 ID（用于部署时替换 `worker/wrangler.toml` 中的 `YOUR_D1_DATABASE_ID`，仅承载扩展下载量与零 ID 本地去重聚合计数，不设设备表、不存设备 ID 或 IP）；
 - `secrets.CLOUDFLARE_STATS_KV_ID`（或同名 Variable）：`STATS_KV` 命名空间 ID（用于部署时替换 `worker/wrangler.toml` 中的 `YOUR_KV_NAMESPACE_ID`）；
 - `secrets.WORKER_GITHUB_TOKEN`（可选）：仅拥有本仓库 **Actions: Read and write** 与 **Contents: Read** 的 Fine-grained PAT，配置后会在部署时自动同步为 Worker 的 `GITHUB_TOKEN` Secret；
 - `secrets.DASHBOARD_TOKEN`（可选，或通过 `npx wrangler secret put DASHBOARD_TOKEN` 本地配置）：保护 `/dashboard` 与 `/v1/dashboard/*` 的管理员访问令牌；
